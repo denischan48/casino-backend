@@ -7,3 +7,4 @@ sqlalchemy==2.0.36        # работа с базой данных
 pydantic==2.10.3          # проверка входящих/исходящих данных
 pydantic-settings==2.6.1  # чтение настроек из .env файла
 python-dotenv==1.0.1      # подхватывает переменные из .env
+psycopg2-binary==2.9.10   # драйвер для подключения к PostgreSQL (Neon)
