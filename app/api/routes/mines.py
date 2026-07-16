@@ -10,10 +10,17 @@
 позиции мин там лежат с самого начала (это нужно бэку для проверки открытий),
 но во фронт они никогда не уходят, пока раунд не завершится (проигрыш/выигрыш).
 Так игрок не может подсмотреть, где мины, через дебаг запросов в браузере.
+
+ПОМЕТКА (фикс): добавлен flag_modified() на каждое изменение round_row.meta —
+явно говорим SQLAlchemy "это поле поменялось, точно сохрани его при commit()".
+Обычно переприсваивание атрибута само по себе триггерит это, но для JSON-полей
+бывают редкие случаи, когда изменение не подхватывается — flag_modified решает
+эту проблему на 100%, без побочных эффектов.
 """
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.deps import get_current_user
 from app.db.session import get_db
@@ -123,6 +130,7 @@ def open_cell(
         # --- проигрыш: раскрываем все мины, раунд завершён ---
         meta["status"] = "lost"
         round_row.meta = meta
+        flag_modified(round_row, "meta")
         round_row.is_win = False
         round_row.payout = 0
         db.commit()
@@ -149,6 +157,7 @@ def open_cell(
         payout = round(round_row.bet_amount * current_multiplier)
         meta["status"] = "won"
         round_row.meta = meta
+        flag_modified(round_row, "meta")
         round_row.is_win = True
         round_row.payout = payout
         round_row.multiplier = current_multiplier
@@ -172,13 +181,15 @@ def open_cell(
 
     # --- игра продолжается ---
     round_row.meta = meta
+    flag_modified(round_row, "meta")
     db.commit()
+    db.refresh(round_row)
 
     return {
         "status": "active",
         "cell_index": payload.cell_index,
         "is_mine": False,
-        "opened_cells": meta["opened_cells"],
+        "opened_cells": round_row.meta["opened_cells"],
         "current_multiplier": current_multiplier,
         "payout": None,
         "new_balance": None,
@@ -204,6 +215,7 @@ def cashout(
 
     meta["status"] = "cashed_out"
     round_row.meta = meta
+    flag_modified(round_row, "meta")
     round_row.is_win = True
     round_row.payout = payout
     round_row.multiplier = current_multiplier
