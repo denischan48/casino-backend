@@ -1,12 +1,15 @@
 """
-Роут раздела "Апгрейды".
+Роут раздела "Апгрейды" — версия с апгрейдом сразу НЕСКОЛЬКИХ предметов.
 
-  GET  /upgrade/inventory              — что лежит у юзера прямо сейчас
-  GET  /upgrade/targets/{item_id}       — во что можно апгрейднуть конкретный предмет + шансы
-  POST /upgrade/attempt                 — попытка апгрейда (честный ролл, риск сгорания предмета)
+  GET  /upgrade/inventory                    — что лежит у юзера прямо сейчас
+  GET  /upgrade/targets?item_ids=1,2,3        — во что можно апгрейднуть СУММУ выбранных предметов + шансы
+  POST /upgrade/attempt                       — попытка апгрейда суммы предметов (честный ролл)
+
+ПОМЕТКА ДЕНИСУ: логика шанса не поменялась (та же формула из upgrade_service.py) —
+просто вместо цены одного предмета теперь берём сумму цен всех выбранных.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -36,7 +39,7 @@ def get_inventory(
     for row in rows:
         nft = db.query(NftCatalog).filter(NftCatalog.id == row.nft_id).first()
         if not nft:
-            continue  # на случай если запись каталога когда-то удалили
+            continue
         result.append(
             InventoryItemOut(
                 id=row.id,
@@ -48,27 +51,51 @@ def get_inventory(
     return result
 
 
-@router.get("/targets/{item_id}", response_model=list[UpgradeTargetOut])
+def _load_owned_items(db: Session, user: User, item_ids: list[int]) -> list[tuple[UserInventory, NftCatalog]]:
+    """
+    Достаёт из базы все запрошенные предметы инвентаря, проверяя что они
+    реально принадлежат юзеру. Бросает 400/404, если что-то не сходится.
+    """
+    if not item_ids:
+        raise HTTPException(status_code=400, detail="Нужно выбрать хотя бы один предмет")
+
+    unique_ids = list(set(item_ids))
+
+    rows = (
+        db.query(UserInventory)
+        .filter(UserInventory.id.in_(unique_ids), UserInventory.user_id == user.id)
+        .all()
+    )
+
+    if len(rows) != len(unique_ids):
+        raise HTTPException(status_code=404, detail="Один или несколько предметов не найдены в твоём инвентаре")
+
+    result = []
+    for row in rows:
+        nft = db.query(NftCatalog).filter(NftCatalog.id == row.nft_id).first()
+        if not nft:
+            raise HTTPException(status_code=404, detail="Предмет отсутствует в каталоге")
+        result.append((row, nft))
+    return result
+
+
+@router.get("/targets", response_model=list[UpgradeTargetOut])
 def get_targets(
-    item_id: int,
+    item_ids: str = Query(..., description="id предметов инвентаря через запятую, например 1,2,3"),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    inv_item = (
-        db.query(UserInventory)
-        .filter(UserInventory.id == item_id, UserInventory.user_id == user.id)
-        .first()
-    )
-    if not inv_item:
-        raise HTTPException(status_code=404, detail="Предмет не найден в твоём инвентаре")
+    try:
+        ids = [int(x) for x in item_ids.split(",") if x.strip() != ""]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="item_ids должен быть списком чисел через запятую")
 
-    input_nft = db.query(NftCatalog).filter(NftCatalog.id == inv_item.nft_id).first()
-    if not input_nft:
-        raise HTTPException(status_code=404, detail="Предмет отсутствует в каталоге")
+    owned = _load_owned_items(db, user, ids)
+    total_value = sum(nft.value for _, nft in owned)
 
     candidates = (
         db.query(NftCatalog)
-        .filter(NftCatalog.value > input_nft.value)
+        .filter(NftCatalog.value > total_value)
         .order_by(NftCatalog.value.asc())
         .all()
     )
@@ -79,7 +106,7 @@ def get_targets(
             name=c.name,
             image_url=c.image_url,
             value=c.value,
-            chance=upgrade_service.calc_chance(input_nft.value, c.value),
+            chance=upgrade_service.calc_chance(total_value, c.value),
         )
         for c in candidates
     ]
@@ -91,31 +118,29 @@ def attempt_upgrade(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    inv_item = (
-        db.query(UserInventory)
-        .filter(UserInventory.id == payload.inventory_item_id, UserInventory.user_id == user.id)
-        .first()
-    )
-    if not inv_item:
-        raise HTTPException(status_code=404, detail="Предмет не найден в твоём инвентаре")
+    owned = _load_owned_items(db, user, payload.inventory_item_ids)
+    total_value = sum(nft.value for _, nft in owned)
 
-    input_nft = db.query(NftCatalog).filter(NftCatalog.id == inv_item.nft_id).first()
     target_nft = db.query(NftCatalog).filter(NftCatalog.id == payload.target_nft_id).first()
-    if not input_nft or not target_nft:
-        raise HTTPException(status_code=404, detail="Предмет отсутствует в каталоге")
+    if not target_nft:
+        raise HTTPException(status_code=404, detail="Целевой предмет отсутствует в каталоге")
 
-    # --- шанс считаем СЕРВЕРОМ заново, не доверяя тому, что было показано раньше ---
-    chance = upgrade_service.calc_chance(input_nft.value, target_nft.value)
+    if target_nft.value <= total_value:
+        raise HTTPException(status_code=400, detail="Цель должна быть дороже суммы отдаваемых предметов")
+
+    # --- шанс считаем СЕРВЕРОМ заново, от суммы, не доверяя фронту ---
+    chance = upgrade_service.calc_chance(total_value, target_nft.value)
 
     # --- честный ролл ---
     roll_value, used_nonce = fairness_service.next_roll(db, user)
     win = roll_value < chance
 
     result_item = None
-    lost_item = None
+    lost_items = None
 
-    # --- исходный предмет в любом случае покидает инвентарь (риск) ---
-    db.delete(inv_item)
+    # --- все отданные предметы в любом случае покидают инвентарь (риск) ---
+    for inv_item, _nft in owned:
+        db.delete(inv_item)
 
     if win:
         new_item = UserInventory(user_id=user.id, nft_id=target_nft.id, source="upgrade")
@@ -124,20 +149,21 @@ def attempt_upgrade(
             name=target_nft.name, image_url=target_nft.image_url, value=target_nft.value
         )
     else:
-        lost_item = UpgradeResultItemOut(
-            name=input_nft.name, image_url=input_nft.image_url, value=input_nft.value
-        )
+        lost_items = [
+            UpgradeResultItemOut(name=nft.name, image_url=nft.image_url, value=nft.value)
+            for _inv_item, nft in owned
+        ]
 
     round_row = GameRound(
         user_id=user.id,
         game_type="upgrade",
-        bet_amount=input_nft.value,
+        bet_amount=total_value,
         payout=target_nft.value if win else 0,
-        multiplier=round(target_nft.value / input_nft.value, 4) if win else None,
+        multiplier=round(target_nft.value / total_value, 4) if win else None,
         is_win=win,
         meta={
-            "input_nft_id": input_nft.id,
-            "input_nft_name": input_nft.name,
+            "input_nft_ids": [nft.id for _inv_item, nft in owned],
+            "input_total_value": total_value,
             "target_nft_id": target_nft.id,
             "target_nft_name": target_nft.name,
             "chance": chance,
@@ -153,6 +179,7 @@ def attempt_upgrade(
     if win and target_nft.value > user.top_win:
         user.top_win = target_nft.value
 
+    # --- всё разом одной транзакцией: либо все удаления + начисление + запись раунда, либо ничего ---
     db.commit()
     db.refresh(user)
 
@@ -161,7 +188,7 @@ def attempt_upgrade(
         "chance": chance,
         "roll": roll_value,
         "result_item": result_item,
-        "lost_item": lost_item,
+        "lost_items": lost_items,
         "nonce": used_nonce,
         "server_seed_hash": user.server_seed_hash,
     }
